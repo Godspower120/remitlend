@@ -13,6 +13,7 @@
 #                       ──► migration-check (path-filtered)
 #                       ──► contracts ──► contract-compatibility (#407)
 #   boundary-check (#580) ──► backend / frontend / contracts / scripts-typecheck
+#   storage-audit (#818) ──► contracts
 # ─────────────────────────────────────────────────────────────────────────────
 name: RemitLend CI
 
@@ -48,6 +49,24 @@ jobs:
           node-version: 20
       - name: Enforce package dependency boundaries
         run: node scripts/check-dependency-boundaries.mjs
+
+  # ── 0b. Storage audit verification (issue #818) ─────────────────────────────
+  # Verifies that every `env.storage().persistent().set(...)` call in the
+  # contract sources is documented in contracts/STORAGE_AUDIT.md so that
+  # undocumented persistent storage cannot silently exceed Soroban rent
+  # budgets.
+  storage-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Use Node.js 20
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+      - name: Verify every persistent storage key is documented
+        run: node scripts/check-storage-audit.mjs
 
   # ── 1. Supply-chain audit ───────────────────────────────────────────────────
   supply-chain-audit:
@@ -225,25 +244,17 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-
       - name: Use Node.js 20
         uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: |
-            backend/package-lock.json
-            frontend/package-lock.json
-
-      - name: Verify documented scripts exist in package.json
-        run: node scripts/check-docs-scripts.mjs
-
-      - name: Verify documented env vars against .env.example
-        run: node scripts/check-docs-env.mjs
-
-      - name: Install backend dependencies (documented)
+          cache-dependency-path: backend/package-lock.json
+      - name: Install backend dependencies
         run: npm ci
         working-directory: backend
+      - name: Verify contributor quick-start
+        run: node scripts/check-contributor-quickstart.mjs
 
       - name: Install frontend dependencies (documented)
         run: npm ci
