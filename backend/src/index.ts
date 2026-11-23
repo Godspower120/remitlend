@@ -46,6 +46,7 @@ import {
   startContractVerificationCron,
   stopContractVerificationCron,
 } from './cron/contractVerificationJob.js';
+import { startGovernanceSweepCron, stopGovernanceSweepCron } from './cron/governanceSweepJob.js';
 // Imported the score decay scheduler initialization wrapper
 import { startScoreDecayScheduler } from './cron/scoreDecayJob.js';
 import { initializePauseState } from './middleware/pauseGuard.js';
@@ -149,6 +150,9 @@ const server = app.listen(port, () => {
   // Start contract verification polling against Stellar explorer
   startContractVerificationCron();
 
+  // Nightly purge of TTL-expired multisig governance proposals (#785)
+  startGovernanceSweepCron();
+
   // Wire up and activate the score decay daily scheduler loop
   scoreDecaySchedulerHandle = startScoreDecayScheduler() || null;
 
@@ -200,6 +204,7 @@ const shutdown = async (signal: 'SIGTERM' | 'SIGINT') => {
     stopLoanDueCheckCron();
     stopApiKeyExpiryCron();
     stopContractVerificationCron();
+    stopGovernanceSweepCron();
     await stopIndexer();
     stopDefaultCheckerScheduler();
     stopWebhookRetryProcessor();

@@ -19,7 +19,12 @@ const MIN_TIMELOCK_SECONDS: u64 = 86_400;
 const MAX_SIGNERS: u32 = 20;
 
 /// Time-to-live for proposals before they expire (7 days in seconds).
-const PROPOSAL_TTL_SECONDS: u64 = 604_800;
+pub(crate) const PROPOSAL_TTL_SECONDS: u64 = 604_800;
+
+/// Upper bound on proposals examined by a single `sweep_expired` call,
+/// regardless of the caller-supplied `max_count` (keeps the call within
+/// Soroban resource limits).
+const MAX_SWEEP_BATCH: u32 = 100;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -29,6 +34,8 @@ const KEY_PENDING: Symbol = symbol_short!("PENDING");
 const KEY_TARGET: Symbol = symbol_short!("TARGET");
 const KEY_LAST_CANCELLED_AT: Symbol = symbol_short!("CANCEL_AT");
 const KEY_PROPOSAL_COUNT: Symbol = symbol_short!("COUNT");
+/// Next pause-proposal id `sweep_expired` will examine.
+const KEY_SWEEP_CURSOR: Symbol = symbol_short!("SWEEPCUR");
 
 const REPROPOSAL_COOLDOWN_SECONDS: u64 = 3600; // 1 hour
 const CURRENT_VERSION: u32 = 1;
@@ -149,6 +156,17 @@ pub struct ProposalExpiredEvent {
     pub expiry_timestamp: u64,
 }
 
+/// Emitted once per proposal removed by `sweep_expired`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalSweptEvent {
+    /// Proposal id (admin-transfer id or pause-proposal id, see `kind`).
+    pub proposal_id: u32,
+    /// `admin` for admin-transfer proposals, `pause` for emergency-pause proposals.
+    pub kind: Symbol,
+    pub proposed_at: u64,
+    pub expired_at: u64,
+    pub swept_at: u64,
 /// Per-operation pause flags. Mirrors the lending pool's `PauseFlags` so the
 /// governance payload can be consumed directly by the pool and loan manager.
 #[contracttype]
@@ -463,6 +481,499 @@ impl GovernanceContract {
         Ok(())
     }
 
+    // ── Approve ───────────────────────────────────────────────────────────────
+
+    /// Record an approval from a designated signer.
+    ///
+    /// Idempotent — calling twice from the same signer records one approval.
+    /// Soroban's require_auth guarantees the caller genuinely controls `signer`.
+    pub fn approve_transfer(env: Env, signer: Address) -> Result<(), GovernanceError> {
+        signer.require_auth();
+
+        let mut pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+
+        if pending.status != ProposalStatus::Active {
+            return Err(GovernanceError::ProposalNotActive);
+        }
+
+        let is_valid = pending.signers.iter().any(|s| s == signer);
+        if !is_valid {
+            return Err(GovernanceError::SignerNotAllowed);
+        }
+
+        // Map::set is idempotent — duplicate calls do not increment the count
+        pending.approvals.set(signer.clone(), true);
+
+        let approvals_so_far = pending.approvals.len();
+        let threshold = pending.threshold;
+        let proposal_id = pending.id;
+
+        env.storage().instance().set(&KEY_PENDING, &pending);
+
+        env.events().publish(
+            (symbol_short!("GovAppr"), signer.clone()),
+            ProposalApprovedEvent {
+                proposal_id,
+                signer,
+                approvals_so_far,
+                threshold,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    // ── Finalize ──────────────────────────────────────────────────────────────
+
+    /// Finalize the pending admin transfer.
+    ///
+    /// Callable by anyone once BOTH conditions hold:
+    ///   1. now >= executable_after   (timelock elapsed)
+    ///   2. approval_count >= threshold
+    ///
+    /// Calls set_admin on the target RemitLend contract via cross-contract
+    /// invocation. The target must expose:
+    ///   pub fn set_admin(env: Env, new_admin: Address)
+    /// and must verify the caller is this governance contract address.
+    pub fn finalize_admin_transfer(env: Env, caller: Address) -> Result<(), GovernanceError> {
+        caller.require_auth();
+
+        let pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+
+        if pending.status != ProposalStatus::Active {
+            return Err(GovernanceError::ProposalNotActive);
+        }
+
+        // Get target early to prevent archiving issues in tests
+        let target: Address = env
+            .storage()
+            .instance()
+            .get(&KEY_TARGET)
+            .ok_or(GovernanceError::TargetNotSet)?;
+
+        let now = env.ledger().timestamp();
+
+        // INV-1: timelock must have elapsed
+        if now < pending.executable_after {
+            return Err(GovernanceError::TimelockNotElapsed);
+        }
+
+        // INV-3: proposal must not have expired
+        let expiry_time = pending.proposed_at.saturating_add(PROPOSAL_TTL_SECONDS);
+        if now >= expiry_time {
+            return Err(GovernanceError::ProposalExpired);
+        }
+
+        // INV-2: threshold must be met
+        let approval_count = pending.approvals.len();
+        if approval_count < pending.threshold {
+            return Err(GovernanceError::ThresholdNotMet);
+        }
+
+        let new_admin = pending.proposed_admin.clone();
+
+        // 1. Interactions: Cross-contract call to update global admin in the RemitLend protocol contract.
+        // If this call fails (panics/traps), the entire transaction will rollback by default in Soroban.
+        // We call this FIRST to ensure the remote state change is attempted before committing local changes.
+        env.invoke_contract::<()>(
+            &target,
+            &symbol_short!("set_admin"),
+            soroban_sdk::vec![&env, new_admin.clone().into_val(&env)],
+        );
+
+        // 2. Effects: Clear pending transfer and update local admin state only after successful interaction.
+        env.storage().instance().remove(&KEY_PENDING);
+        env.storage().instance().set(&KEY_ADMIN, &new_admin);
+
+        // Update the last cancelled/proposal timestamp to enforce reproposal cooldown
+        env.storage().instance().set(&KEY_LAST_CANCELLED_AT, &now);
+
+        env.events().publish(
+            (symbol_short!("GovFin"), new_admin.clone()),
+            AdminTransferFinalizedEvent {
+                new_admin,
+                finalized_by: caller,
+                approval_count,
+                timestamp: now,
+            },
+        );
+        Ok(())
+    }
+
+    // ── Cancel ────────────────────────────────────────────────────────────────
+
+    /// Cancel a pending transfer. Only the current admin may do this.
+    /// After cancellation the process must restart from propose_admin_transfer.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), GovernanceError> {
+        let admin = Self::read_admin(&env)?;
+        admin.require_auth();
+
+        let mut pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+
+        if pending.status == ProposalStatus::Cancelled {
+            return Ok(());
+        }
+
+        pending.status = ProposalStatus::Cancelled;
+        env.storage().instance().set(&KEY_PENDING, &pending);
+
+        env.storage()
+            .instance()
+            .set(&KEY_LAST_CANCELLED_AT, &env.ledger().timestamp());
+
+        env.events().publish(
+            (symbol_short!("GovCncl"), admin.clone()),
+            AdminTransferCancelledEvent {
+                cancelled_by: admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Forcefully cancel any open proposal regardless of its approval count.
+    /// Requires admin auth. Prevents further actions on the proposal.
+    pub fn emergency_cancel_proposal(
+        env: Env,
+        proposal_id: u32,
+        reason: Option<soroban_sdk::String>,
+    ) -> Result<(), GovernanceError> {
+        let admin = Self::read_admin(&env)?;
+        admin.require_auth();
+
+        let mut pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+
+        if pending.id != proposal_id {
+            return Err(GovernanceError::ProposalIdMismatch);
+        }
+
+        if pending.status == ProposalStatus::Cancelled {
+            return Ok(());
+        }
+
+        pending.status = ProposalStatus::Cancelled;
+        env.storage().instance().set(&KEY_PENDING, &pending);
+
+        // We also set the cooldown for security, same as regular cancel.
+        env.storage()
+            .instance()
+            .set(&KEY_LAST_CANCELLED_AT, &env.ledger().timestamp());
+
+        env.events().publish(
+            (symbol_short!("GovEmerg"), admin.clone()),
+            ProposalCancelledEvent {
+                cancelled_by: admin,
+                proposal_id,
+                reason,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    // ── Expire ─────────────────────────────────────────────────────────────────
+
+    /// Expire a pending transfer proposal that has exceeded its TTL.
+    ///
+    /// Anyone can call this function once the proposal has passed its TTL.
+    /// This cleans up stale proposals and allows new ones to be created.
+    pub fn expire_proposal(env: Env, caller: Address) -> Result<(), GovernanceError> {
+        caller.require_auth();
+
+        let pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+
+        if pending.status != ProposalStatus::Active {
+            return Err(GovernanceError::ProposalNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        let expiry_time = pending.proposed_at.saturating_add(PROPOSAL_TTL_SECONDS);
+
+        if now < expiry_time {
+            return Err(GovernanceError::ProposalNotExpired);
+        }
+
+        env.storage().instance().remove(&KEY_PENDING);
+
+        env.events().publish(
+            (symbol_short!("GovExp"), caller.clone()),
+            ProposalExpiredEvent {
+                expired_by: caller,
+                proposal_timestamp: pending.proposed_at,
+                expiry_timestamp: now,
+            },
+        );
+        Ok(())
+    }
+
+    // ── Sweep ─────────────────────────────────────────────────────────────────
+
+    /// Purge up to `max_count` proposals whose TTL (`PROPOSAL_TTL_SECONDS`
+    /// after `proposed_at`) has elapsed, reclaiming their storage rent.
+    ///
+    /// Permissionless: it can only delete proposals that are already expired
+    /// and therefore can no longer be approved, finalized or executed.
+    /// Unexpired proposals are never touched.
+    ///
+    /// Examines the admin-transfer slot first, then pause proposals in id
+    /// order starting from a persisted cursor. Because ids are issued in
+    /// timestamp order and the TTL is constant, the scan stops at the first
+    /// unexpired pause proposal. `max_count` (clamped to `MAX_SWEEP_BATCH`)
+    /// bounds the number of proposal slots examined.
+    ///
+    /// Emits `ProposalSweptEvent` per removed proposal and returns the number
+    /// removed.
+    pub fn sweep_expired(env: Env, max_count: u32) -> u32 {
+        let budget = max_count.min(MAX_SWEEP_BATCH);
+        let now = env.ledger().timestamp();
+        let mut examined: u32 = 0;
+        let mut removed: u32 = 0;
+
+        if budget == 0 {
+            return 0;
+        }
+
+        // 1. Admin-transfer proposal (single slot).
+        if let Some(pending) = env
+            .storage()
+            .instance()
+            .get::<Symbol, PendingTransfer>(&KEY_PENDING)
+        {
+            examined += 1;
+            let expired_at = pending.proposed_at.saturating_add(PROPOSAL_TTL_SECONDS);
+            if now >= expired_at {
+                env.storage().instance().remove(&KEY_PENDING);
+                removed += 1;
+                Self::emit_swept(&env, pending.id, symbol_short!("admin"), pending.proposed_at, expired_at, now);
+            }
+        }
+
+        // 2. Emergency-pause proposals, oldest first.
+        let last_id = emergency_pause::last_pause_id(&env);
+        let mut cursor: u32 = env
+            .storage()
+            .instance()
+            .get(&KEY_SWEEP_CURSOR)
+            .unwrap_or(1)
+            .max(1);
+
+        while examined < budget && cursor <= last_id {
+            let key = emergency_pause::pause_proposal_key(&env, cursor);
+            match env.storage().persistent().get::<Symbol, PendingPause>(&key) {
+                None => {}
+                Some(proposal) => {
+                    let expired_at = proposal.proposed_at.saturating_add(PROPOSAL_TTL_SECONDS);
+                    if now < expired_at {
+                        // Every later id is newer, so nothing beyond is expired.
+                        break;
+                    }
+                    env.storage().persistent().remove(&key);
+                    removed += 1;
+                    Self::emit_swept(&env, proposal.id, symbol_short!("pause"), proposal.proposed_at, expired_at, now);
+                }
+            }
+            examined += 1;
+            cursor += 1;
+        }
+
+        env.storage().instance().set(&KEY_SWEEP_CURSOR, &cursor);
+        removed
+    }
+
+    fn emit_swept(env: &Env, proposal_id: u32, kind: Symbol, proposed_at: u64, expired_at: u64, swept_at: u64) {
+        env.events().publish(
+            (symbol_short!("GovSwept"), kind.clone()),
+            ProposalSweptEvent {
+                proposal_id,
+                kind,
+                proposed_at,
+                expired_at,
+                swept_at,
+            },
+        );
+    }
+
+    // ── Views ─────────────────────────────────────────────────────────────────
+
+    pub fn get_current_admin(env: Env) -> Result<Address, GovernanceError> {
+        Self::read_admin(&env)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, GovernanceError> {
+        Self::read_admin(&env)
+    }
+
+    pub fn get_target(env: Env) -> Result<Address, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&KEY_TARGET)
+            .ok_or(GovernanceError::TargetNotSet)
+    }
+
+    pub fn get_pending_transfer(env: Env) -> Result<PendingTransfer, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)
+    }
+
+    pub fn get_pending(env: Env) -> Option<PendingTransfer> {
+        env.storage().instance().get(&KEY_PENDING)
+    }
+
+    pub fn has_pending_transfer(env: Env) -> bool {
+        if let Some(pending) = env
+            .storage()
+            .instance()
+            .get::<Symbol, PendingTransfer>(&KEY_PENDING)
+        {
+            pending.status == ProposalStatus::Active
+        } else {
+            false
+        }
+    }
+
+    pub fn get_approval_count(env: Env) -> Result<u32, GovernanceError> {
+        let pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+        Ok(pending.approvals.len())
+    }
+
+    /// Returns seconds remaining until the timelock expires.
+    /// Returns 0 if already elapsed or no pending transfer exists.
+    pub fn get_timelock_remaining(env: Env) -> u64 {
+        match env
+            .storage()
+            .instance()
+            .get::<Symbol, PendingTransfer>(&KEY_PENDING)
+        {
+            None => 0,
+            Some(p) => {
+                let now = env.ledger().timestamp();
+                if now >= p.executable_after {
+                    0
+                } else {
+                    p.executable_after.saturating_sub(now)
+                }
+            }
+        }
+    }
+
+    pub fn get_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&KEY_PROPOSAL_COUNT)
+            .unwrap_or(0)
+    }
+
+    pub fn get_signers(env: Env) -> Result<Vec<Address>, GovernanceError> {
+        let pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+        Ok(pending.signers)
+    }
+
+    pub fn get_threshold(env: Env) -> Result<u32, GovernanceError> {
+        let pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+        Ok(pending.threshold)
+    }
+
+    pub fn has_approved(env: Env, signer: Address) -> Result<bool, GovernanceError> {
+        let pending: PendingTransfer = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING)
+            .ok_or(GovernanceError::NoPendingTransfer)?;
+        Ok(pending.approvals.get(signer).unwrap_or(false))
+    }
+
+    // ── Emergency Pause (Multi-Sig Governance) ─────────────────────────────────
+
+    /// Propose an emergency pause with multi-signature governance.
+    /// Empty target_functions = global pause; otherwise function-level circuit breaker.
+    /// Includes 24-hour timelock before execution.
+    pub fn propose_emergency_pause(
+        env: Env,
+        pause_action: bool,
+        target_functions: Vec<Symbol>,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<u32, GovernanceError> {
+        emergency_pause::propose_pause(
+            &env,
+            pause_action,
+            target_functions,
+            signers,
+            threshold,
+        )
+    }
+
+    /// Approve a pending pause proposal (multi-sig voting).
+    /// Caller must be in the signer list and signs this transaction.
+    pub fn approve_emergency_pause(env: Env, proposal_id: u32) -> Result<(), GovernanceError> {
+        let signer = env.invoker();
+        emergency_pause::approve_pause(&env, proposal_id, &signer)
+    }
+
+    /// Execute an approved pause proposal after the 24-hour timelock.
+    /// Requires threshold number of approvals.
+    pub fn execute_emergency_pause(env: Env, proposal_id: u32) -> Result<(), GovernanceError> {
+        let executor = env.invoker();
+        emergency_pause::execute_pause(&env, proposal_id, &executor)
+    }
+
+    /// Cancel a pending pause proposal (before execution).
+    pub fn cancel_emergency_pause(env: Env, proposal_id: u32) -> Result<(), GovernanceError> {
+        let canceller = env.invoker();
+        emergency_pause::cancel_pause(&env, proposal_id, &canceller)
+    }
+
+    /// Check if a specific function is paused (circuit breaker).
+    /// Returns true if either globally paused or this function is paused.
+    pub fn is_function_paused(env: Env, function_id: Symbol) -> bool {
+        emergency_pause::is_function_paused(&env, &function_id)
+    }
+
+    /// Get all currently paused functions.
+    pub fn get_paused_functions(env: Env) -> Vec<Symbol> {
+        emergency_pause::get_paused_functions(&env)
+    }
+
+    /// Check global pause status.
+    pub fn is_globally_paused(env: Env) -> bool {
+        emergency_pause::is_globally_paused(&env)
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn read_admin(env: &Env) -> Result<Address, GovernanceError> {
